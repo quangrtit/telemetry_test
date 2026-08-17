@@ -1,0 +1,28 @@
+# Visual Studio user state and caches
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.vsidx
+*.ipch
+
+# Build output and intermediate files
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.idb
+*.tlog
+*.recipe
+*.FileListAbsolute.txt
+
+# Runtime output
+*.log
