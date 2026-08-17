@@ -10,7 +10,8 @@
 # Build output and intermediate files
 [Bb]in/
 [Oo]bj/
-[Rr]elease/
+# [Dd]ebug/
+# [Rr]elease/
 x86/
 *.dll
 *.pdb
