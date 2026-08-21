@@ -21,7 +21,22 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 umask 077
 
-TOOL_VERSION="1.0.0"
+TOOL_VERSION="1.1.0"
+
+# Fast mode only inspects processes whose kernel comm matches a known product
+# name. Deep mode retains executable-path discovery, but must inspect every PID.
+PROCESS_SCAN_MODE=${LINUX_SECURITY_INVENTORY_SCAN_MODE:-fast}
+case "$PROCESS_SCAN_MODE" in
+    fast|deep) ;;
+    *)
+        printf '%s\n' "ERROR: LINUX_SECURITY_INVENTORY_SCAN_MODE must be fast or deep" >&2
+        exit 2
+        ;;
+esac
+
+# Runtime evidence is a fallback. Bound it so a process with an unusually large
+# FD table cannot make an inventory run unbounded.
+FALCO_FD_SCAN_LIMIT=1024
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -212,20 +227,12 @@ safe_readlink() {
     fi
 }
 
-proc_exe_base() {
-    _pid=$1
-    _exe=$(safe_readlink "/proc/$_pid/exe")
-    if [ -n "$_exe" ]; then
-        basename "$_exe" 2>/dev/null || printf '%s' "$_exe"
-    else
-        printf ''
-    fi
-}
-
 proc_comm() {
     _pid=$1
     if [ -r "/proc/$_pid/comm" ]; then
-        head -n 1 "/proc/$_pid/comm" 2>/dev/null | tr '\t\r\n' '   ' | sed 's/[[:space:]]*$//'
+        _comm_value=""
+        IFS= read -r _comm_value < "/proc/$_pid/comm" 2>/dev/null || :
+        printf '%s' "$_comm_value"
     elif [ -r "/proc/$_pid/stat" ]; then
         # Best-effort fallback only. comm may contain ')' so this is deliberately not
         # used when /proc/PID/comm exists.
@@ -265,6 +272,54 @@ is_falco_process() {
     return 1
 }
 
+is_security_comm() {
+    _candidate_comm=$1
+    case "$_candidate_comm" in
+        falco|kesl|kesl-*|klnagent|klnagent-*|kav4fs|kav4fs-*|kaspersky|kaspersky-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Prefer one compiled /proc scan over spawning several utilities for every PID.
+# pgrep and ps both match kernel comm, not full argv, so secrets are not emitted.
+fast_candidate_pids() {
+    _pattern='falco|kesl|kesl-.*|klnagent|klnagent-.*|kav4fs|kav4fs-.*|kaspersky|kaspersky-.*'
+
+    if have pgrep; then
+        pgrep -x "$_pattern" 2>/dev/null || :
+        return
+    fi
+
+    _ps_file="$TMPDIR_SAFE/process-list"
+    if have ps && ps -e -o pid= -o comm= > "$_ps_file" 2>/dev/null; then
+        awk '$2 ~ /^(falco|kesl(-.*)?|klnagent(-.*)?|kav4fs(-.*)?|kaspersky(-.*)?)$/ {
+            print $1
+        }' "$_ps_file" 2>/dev/null
+        rm -f "$_ps_file" 2>/dev/null || :
+        return
+    fi
+    rm -f "$_ps_file" 2>/dev/null || :
+
+    # Minimal Linux fallback: one shell-builtin read per PID, with no pipeline.
+    for _candidate_path in /proc/[0-9]*; do
+        [ -d "$_candidate_path" ] || continue
+        _candidate_comm=""
+        IFS= read -r _candidate_comm < "$_candidate_path/comm" 2>/dev/null || continue
+        if is_security_comm "$_candidate_comm"; then
+            printf '%s\n' "${_candidate_path##*/}"
+        fi
+    done
+}
+
+deep_candidate_pids() {
+    for _candidate_path in /proc/[0-9]*; do
+        [ -d "$_candidate_path" ] || continue
+        printf '%s\n' "${_candidate_path##*/}"
+    done
+}
+
 falco_cli_mode_and_config() {
     _pid=$1
     FALCO_CLI_MODE=""
@@ -274,30 +329,33 @@ falco_cli_mode_and_config() {
 
     # Read NUL-separated argv one item per line. Do not emit argv to output.
     # We only extract known Falco mode/config tokens.
-    tr '\000' '\n' < "/proc/$_pid/cmdline" 2>/dev/null | awk '
-        BEGIN { prev="" }
+    _argv_file="$TMPDIR_SAFE/falco.argv.$_pid"
+    tr '\000' '\n' < "/proc/$_pid/cmdline" 2>/dev/null | awk -v sep="$US" '
+        BEGIN { prev=""; mode=""; cfg="" }
         {
             arg=$0
-            if (prev == "config") { print "CFG=" arg; prev=""; next }
-            if (arg == "-c" || arg == "--config") { prev="config"; next }
-            if (arg ~ /^--config=/) { sub(/^--config=/, "", arg); print "CFG=" arg; next }
-            if (arg == "--modern-bpf" || arg == "--modern_ebpf") print "MODE=modern_ebpf"
-            if (arg ~ /^engine\.kind=modern_ebpf$/) print "MODE=modern_ebpf"
-            if (arg ~ /^engine\.kind=ebpf$/) print "MODE=legacy_ebpf"
-            if (arg ~ /^engine\.kind=kmod$/) print "MODE=kernel_module"
-            if (arg == "-o") { prev="override"; next }
+            if (prev == "config") { cfg=arg; prev=""; next }
             if (prev == "override") {
-                if (arg == "engine.kind=modern_ebpf") print "MODE=modern_ebpf"
-                else if (arg == "engine.kind=ebpf") print "MODE=legacy_ebpf"
-                else if (arg == "engine.kind=kmod") print "MODE=kernel_module"
+                if (arg == "engine.kind=modern_ebpf") mode="modern_ebpf"
+                else if (arg == "engine.kind=ebpf") mode="legacy_ebpf"
+                else if (arg == "engine.kind=kmod") mode="kernel_module"
                 prev=""
+                next
             }
-        }' > "$TMPDIR_SAFE/falco.argv.$_pid" || :
+            if (arg == "-c" || arg == "--config") { prev="config"; next }
+            if (arg ~ /^--config=/) { sub(/^--config=/, "", arg); cfg=arg; next }
+            if (arg == "--modern-bpf" || arg == "--modern_ebpf") mode="modern_ebpf"
+            if (arg ~ /^engine\.kind=modern_ebpf$/) mode="modern_ebpf"
+            if (arg ~ /^engine\.kind=ebpf$/) mode="legacy_ebpf"
+            if (arg ~ /^engine\.kind=kmod$/) mode="kernel_module"
+            if (arg == "-o") { prev="override"; next }
+        }
+        END { printf "%s%s%s\n", mode, sep, cfg }
+    ' > "$_argv_file" || :
 
-    if [ -r "$TMPDIR_SAFE/falco.argv.$_pid" ]; then
-        FALCO_CLI_MODE=$(sed -n 's/^MODE=//p' "$TMPDIR_SAFE/falco.argv.$_pid" | tail -n 1)
-        FALCO_CFG_PATH=$(sed -n 's/^CFG=//p' "$TMPDIR_SAFE/falco.argv.$_pid" | tail -n 1)
-        rm -f "$TMPDIR_SAFE/falco.argv.$_pid" 2>/dev/null || :
+    if [ -r "$_argv_file" ]; then
+        IFS="$US" read -r FALCO_CLI_MODE FALCO_CFG_PATH < "$_argv_file" || :
+        rm -f "$_argv_file" 2>/dev/null || :
     fi
 }
 
@@ -308,15 +366,26 @@ falco_env_has_legacy_bpf() {
     tr '\000' '\n' < "/proc/$_pid/environ" 2>/dev/null | grep '^FALCO_BPF_PROBE=' >/dev/null 2>&1
 }
 
+bounded_config_read() {
+    _bounded_cfg=$1
+    if have timeout; then
+        timeout 3 dd if="$_bounded_cfg" bs=65536 count=16 2>/dev/null
+    else
+        dd if="$_bounded_cfg" bs=65536 count=16 2>/dev/null
+    fi
+}
+
 falco_config_mode() {
     _cfg=$1
     [ -n "$_cfg" ] || return
-    [ -r "$_cfg" ] || return
+    # Reject devices, FIFOs and directories. Limit reads to 1 MiB so a bad or
+    # attacker-controlled CLI path cannot cause unbounded I/O or memory use.
+    [ -f "$_cfg" ] && [ -r "$_cfg" ] || return
 
     # Supports modern Falco YAML:
     # engine:
     #   kind: modern_ebpf|ebpf|kmod
-    awk '
+    bounded_config_read "$_cfg" | awk '
         /^[[:space:]]*#/ { next }
         /^[[:space:]]*engine:[[:space:]]*($|#)/ { in_engine=1; next }
         in_engine {
@@ -330,7 +399,18 @@ falco_config_mode() {
                 print x
                 exit
             }
-        }' "$_cfg" 2>/dev/null
+        }' 2>/dev/null
+}
+
+fdinfo_has_bpf() {
+    _fdinfo_file=$1
+    [ -r "$_fdinfo_file" ] || return 1
+    while IFS= read -r _fdinfo_line; do
+        case "$_fdinfo_line" in
+            prog_id:*|map_id:*|link_id:*) return 0 ;;
+        esac
+    done < "$_fdinfo_file"
+    return 1
 }
 
 falco_fd_evidence() {
@@ -339,9 +419,37 @@ falco_fd_evidence() {
     FALCO_HAS_BPF_FD=0
     FALCO_BPF_FD_COUNT=0
     FALCO_DEV_FALCO_FD_COUNT=0
+    FALCO_FD_SCAN_PERFORMED=false
+    FALCO_FD_SCAN_TRUNCATED=false
 
     [ -d "/proc/$_pid/fd" ] || return
-    for _fd in /proc/"$_pid"/fd/*; do
+    FALCO_FD_SCAN_PERFORMED=true
+
+    _fd_list="$TMPDIR_SAFE/falco.fds.$_pid"
+    if have find; then
+        find "/proc/$_pid/fd" -type l -print 2>/dev/null | awk -v limit="$FALCO_FD_SCAN_LIMIT" '
+            NR <= limit { print; next }
+            { print "__SCAN_LIMIT_REACHED__"; exit }
+        ' > "$_fd_list" || :
+    else
+        : > "$_fd_list"
+        _fd_list_count=0
+        for _fd in /proc/"$_pid"/fd/*; do
+            [ -e "$_fd" ] || [ -L "$_fd" ] || continue
+            _fd_list_count=$((_fd_list_count + 1))
+            if [ "$_fd_list_count" -gt "$FALCO_FD_SCAN_LIMIT" ]; then
+                printf '%s\n' "__SCAN_LIMIT_REACHED__" >> "$_fd_list"
+                break
+            fi
+            printf '%s\n' "$_fd" >> "$_fd_list"
+        done
+    fi
+
+    while IFS= read -r _fd; do
+        if [ "$_fd" = "__SCAN_LIMIT_REACHED__" ]; then
+            FALCO_FD_SCAN_TRUNCATED=true
+            break
+        fi
         [ -e "$_fd" ] || [ -L "$_fd" ] || continue
         _t=$(safe_readlink "$_fd")
         _is_bpf=0
@@ -358,14 +466,15 @@ falco_fd_evidence() {
         # Some kernels expose BPF metadata in fdinfo even when readlink text is generic.
         _fdn=${_fd##*/}
         if [ "$_is_bpf" -eq 0 ] && [ -r "/proc/$_pid/fdinfo/$_fdn" ] && \
-           grep -Eq '^(prog_id|map_id|link_id):' "/proc/$_pid/fdinfo/$_fdn" 2>/dev/null; then
+           fdinfo_has_bpf "/proc/$_pid/fdinfo/$_fdn"; then
             _is_bpf=1
         fi
         if [ "$_is_bpf" -eq 1 ]; then
             FALCO_HAS_BPF_FD=1
             FALCO_BPF_FD_COUNT=$((FALCO_BPF_FD_COUNT + 1))
         fi
-    done
+    done < "$_fd_list"
+    rm -f "$_fd_list" 2>/dev/null || :
 }
 
 module_loaded() {
@@ -386,9 +495,14 @@ resolve_falco_mode() {
     FALCO_MODE_CONFIDENCE="low"
     FALCO_MODE_EVIDENCE=""
     FALCO_CONFIG_MODE=""
+    FALCO_HAS_DEV_FALCO=0
+    FALCO_HAS_BPF_FD=0
+    FALCO_BPF_FD_COUNT=0
+    FALCO_DEV_FALCO_FD_COUNT=0
+    FALCO_FD_SCAN_PERFORMED=false
+    FALCO_FD_SCAN_TRUNCATED=false
 
     falco_cli_mode_and_config "$_pid"
-    falco_fd_evidence "$_pid"
 
     # If no explicit config was passed, try common host paths only.
     if [ -z "$FALCO_CFG_PATH" ]; then
@@ -398,16 +512,6 @@ resolve_falco_mode() {
                 break
             fi
         done
-    fi
-    if [ -n "$FALCO_CFG_PATH" ]; then
-        FALCO_CONFIG_MODE=$(falco_config_mode "$FALCO_CFG_PATH")
-    fi
-
-    if [ "$FALCO_HAS_DEV_FALCO" -eq 1 ]; then
-        FALCO_MODE="kernel_module"
-        FALCO_MODE_CONFIDENCE="high"
-        FALCO_MODE_EVIDENCE="falco process has open /dev/falco* fd"
-        return
     fi
 
     if [ -n "$FALCO_CLI_MODE" ]; then
@@ -422,6 +526,10 @@ resolve_falco_mode() {
         FALCO_MODE_CONFIDENCE="high"
         FALCO_MODE_EVIDENCE="FALCO_BPF_PROBE is present in Falco environment"
         return
+    fi
+
+    if [ -n "$FALCO_CFG_PATH" ]; then
+        FALCO_CONFIG_MODE=$(falco_config_mode "$FALCO_CFG_PATH")
     fi
 
     case "$FALCO_CONFIG_MODE" in
@@ -445,6 +553,17 @@ resolve_falco_mode() {
             ;;
     esac
 
+    # Expensive per-FD inspection is only used when CLI, environment and config
+    # did not provide a decisive answer.
+    falco_fd_evidence "$_pid"
+
+    if [ "$FALCO_HAS_DEV_FALCO" -eq 1 ]; then
+        FALCO_MODE="kernel_module"
+        FALCO_MODE_CONFIDENCE="high"
+        FALCO_MODE_EVIDENCE="falco process has open /dev/falco* fd"
+        return
+    fi
+
     if [ "$FALCO_HAS_BPF_FD" -eq 1 ]; then
         FALCO_MODE="ebpf_unknown"
         FALCO_MODE_CONFIDENCE="medium"
@@ -452,7 +571,7 @@ resolve_falco_mode() {
         return
     fi
 
-    if module_loaded falco; then
+    if [ "${FALCO_KMOD_LOADED:-false}" = "true" ]; then
         FALCO_MODE="unknown"
         FALCO_MODE_CONFIDENCE="low"
         FALCO_MODE_EVIDENCE="falco kernel module is loaded globally, but this PID was not proven to use it"
@@ -480,11 +599,17 @@ mk_tmpdir() {
 }
 
 cleanup() {
-    [ -n "${TMPDIR_SAFE:-}" ] && rm -rf "$TMPDIR_SAFE" 2>/dev/null || :
+    if [ -n "${TMPDIR_SAFE:-}" ]; then
+        rm -rf "$TMPDIR_SAFE" 2>/dev/null || :
+        TMPDIR_SAFE=""
+    fi
 }
 
 mk_tmpdir
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 get_distro
 detect_container
@@ -501,43 +626,53 @@ module_loaded falco && FALCO_KMOD_LOADED=true
 
 KASP_FILE="$TMPDIR_SAFE/kaspersky.tsv"
 FALCO_FILE="$TMPDIR_SAFE/falco.tsv"
+CANDIDATE_FILE="$TMPDIR_SAFE/security-pids"
 : > "$KASP_FILE"
 : > "$FALCO_FILE"
+: > "$CANDIDATE_FILE"
 US=$(printf '\037')
 
-PROC_SCAN_ERRORS=0
 PROC_SCAN_COUNT=0
+if [ "$PROCESS_SCAN_MODE" = "deep" ]; then
+    SCAN_STRATEGY="full_proc_executable_scan"
+    deep_candidate_pids > "$CANDIDATE_FILE"
+else
+    SCAN_STRATEGY="process_name_prefilter"
+    fast_candidate_pids > "$CANDIDATE_FILE"
+fi
 
-for _p in /proc/[0-9]*; do
-    [ -d "$_p" ] || continue
-    _pid=${_p##*/}
+while IFS= read -r _pid; do
+    case "$_pid" in
+        ''|*[!0-9]*) continue ;;
+    esac
+    [ -d "/proc/$_pid" ] || continue
     _comm=$(proc_comm "$_pid")
     _exe=$(safe_readlink "/proc/$_pid/exe")
-    _base=""
-    [ -n "$_exe" ] && _base=$(basename "$_exe" 2>/dev/null || printf '')
+    _base=${_exe##*/}
 
     # A process may disappear between reads; that is normal and not an error.
     [ -n "$_comm$_exe" ] || continue
     PROC_SCAN_COUNT=$((PROC_SCAN_COUNT + 1))
 
     if is_kaspersky_process "$_comm" "$_base" "$_exe"; then
-        # Tabs/newlines are normalized so TSV remains parseable.
-        _comm_s=$(printf '%s' "$_comm" | tr '\t\r\n' '   ')
-        _exe_s=$(printf '%s' "$_exe" | tr '\t\r\n' '   ')
+        # Separator/control whitespace is normalized so TSV remains parseable.
+        _comm_s=$(printf '%s' "$_comm" | tr '\037\t\r\n' '    ')
+        _exe_s=$(printf '%s' "$_exe" | tr '\037\t\r\n' '    ')
         printf '%s\037%s\037%s\n' "$_pid" "$_comm_s" "$_exe_s" >> "$KASP_FILE"
     fi
 
     if is_falco_process "$_comm" "$_base" "$_exe"; then
         resolve_falco_mode "$_pid"
-        _comm_s=$(printf '%s' "$_comm" | tr '\t\r\n' '   ')
-        _exe_s=$(printf '%s' "$_exe" | tr '\t\r\n' '   ')
-        _cfg_s=$(printf '%s' "$FALCO_CFG_PATH" | tr '\t\r\n' '   ')
-        _ev_s=$(printf '%s' "$FALCO_MODE_EVIDENCE" | tr '\t\r\n' '   ')
-        printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+        _comm_s=$(printf '%s' "$_comm" | tr '\037\t\r\n' '    ')
+        _exe_s=$(printf '%s' "$_exe" | tr '\037\t\r\n' '    ')
+        _cfg_s=$(printf '%s' "$FALCO_CFG_PATH" | tr '\037\t\r\n' '    ')
+        _ev_s=$(printf '%s' "$FALCO_MODE_EVIDENCE" | tr '\037\t\r\n' '    ')
+        printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
             "$_pid" "$_comm_s" "$_exe_s" "$FALCO_MODE" "$FALCO_MODE_CONFIDENCE" \
-            "$_cfg_s" "$FALCO_BPF_FD_COUNT" "$_ev_s" >> "$FALCO_FILE"
+            "$_cfg_s" "$FALCO_BPF_FD_COUNT" "$FALCO_FD_SCAN_PERFORMED" \
+            "$FALCO_FD_SCAN_TRUNCATED" "$_ev_s" >> "$FALCO_FILE"
     fi
-done
+done < "$CANDIDATE_FILE"
 
 KASP_COUNT=$(wc -l < "$KASP_FILE" 2>/dev/null | tr -d '[:space:]')
 FALCO_COUNT=$(wc -l < "$FALCO_FILE" 2>/dev/null | tr -d '[:space:]')
@@ -586,20 +721,29 @@ printf '    "driver_summary": '; jstr "$FALCO_SUMMARY"; printf ',\n'
 printf '    "kernel_module_loaded": %s,\n' "$FALCO_KMOD_LOADED"
 printf '    "processes": ['
 _first=1
-while IFS="$US" read -r _pid _comm _exe _mode _conf _cfg _bpf_count _evidence; do
+while IFS="$US" read -r _pid _comm _exe _mode _conf _cfg _bpf_count _fd_scanned _fd_truncated _evidence; do
     [ -n "$_pid" ] || continue
     [ "$_first" -eq 1 ] || printf ','
     printf '\n      {"pid": %s, "comm": ' "$_pid"; jstr "$_comm"; printf ', "exe": '; jstr "$_exe"
     printf ', "driver_mode": '; jstr "$_mode"; printf ', "confidence": '; jstr "$_conf"
-    printf ', "config": '; jstr "$_cfg"; printf ', "bpf_fd_count": %s, "evidence": ' "${_bpf_count:-0}"; jstr "$_evidence"; printf '}'
+    printf ', "config": '; jstr "$_cfg"; printf ', "bpf_fd_count": %s' "${_bpf_count:-0}"
+    printf ', "fd_scan_performed": %s, "fd_scan_truncated": %s, "evidence": ' \
+        "${_fd_scanned:-false}" "${_fd_truncated:-false}"; jstr "$_evidence"; printf '}'
     _first=0
 done < "$FALCO_FILE"
 [ "$_first" -eq 1 ] || printf '\n    '
 printf ']\n'
 printf '  },\n'
-printf '  "diagnostics": {"proc_entries_scanned": %s, "notes": [' "$PROC_SCAN_COUNT"
+printf '  "diagnostics": {"scan_mode": '; jstr "$PROCESS_SCAN_MODE"
+printf ', "scan_strategy": '; jstr "$SCAN_STRATEGY"
+printf ', "processes_inspected": %s, "notes": [' "$PROC_SCAN_COUNT"
 _note_first=1
+if [ "$PROCESS_SCAN_MODE" = "fast" ]; then
+    jstr "fast scan matches known process names; use LINUX_SECURITY_INVENTORY_SCAN_MODE=deep only when executable-path discovery is required"
+    _note_first=0
+fi
 if [ "$PROC_VISIBILITY" != "root" ] && [ "$PROC_VISIBILITY" != "normal_or_unknown" ]; then
+    [ "$_note_first" -eq 1 ] || printf ', '
     jstr "procfs hidepid may hide Kaspersky/Falco processes from an unprivileged user"
     _note_first=0
 fi
@@ -612,6 +756,12 @@ if [ "$FALCO_COUNT" -gt 0 ]; then
     if awk -F "$US" '$4=="unknown" || $4=="ebpf_unknown" {found=1} END {exit !found}' "$FALCO_FILE" 2>/dev/null; then
         [ "$_note_first" -eq 1 ] || printf ', '
         jstr "run as root for stronger Falco FD/environment evidence when /proc permissions are restricted"
+        _note_first=0
+    fi
+    if awk -F "$US" '$9=="true" {found=1} END {exit !found}' "$FALCO_FILE" 2>/dev/null; then
+        [ "$_note_first" -eq 1 ] || printf ', '
+        jstr "Falco FD inspection reached its safety limit; FD-derived evidence may be incomplete"
+        _note_first=0
     fi
 fi
 printf ']}\n'
